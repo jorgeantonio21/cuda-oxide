@@ -1197,6 +1197,20 @@ impl<'a> ModuleExportState<'a> {
                         continue;
                     }
 
+                    // AddressOfOp is also virtual in textual LLVM IR: uses
+                    // must print the global symbol directly. Pre-register it
+                    // here so CFG order cannot expose a stale temporary name
+                    // when a later-printed block defines the address used by
+                    // an earlier-printed block.
+                    if op_id == ops::AddressOfOp::get_opid_static() {
+                        let address_of =
+                            Operation::get_op::<ops::AddressOfOp>(op, self.ctx).unwrap();
+                        let global_name = address_of.get_global_name(self.ctx);
+                        let res = op_ref.get_result(0);
+                        value_names.insert(res, format!("@{global_name}"));
+                        continue;
+                    }
+
                     for res in op_ref.results() {
                         let name = format!("%v{next_value_id}");
                         next_value_id += 1;
