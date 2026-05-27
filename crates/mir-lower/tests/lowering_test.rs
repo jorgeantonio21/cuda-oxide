@@ -6,7 +6,7 @@
 use dialect_llvm::ops as llvm;
 use dialect_mir::ops as mir;
 use dialect_nvvm::ops as nvvm;
-use pliron::builtin::op_interfaces::SymbolOpInterface;
+use pliron::builtin::op_interfaces::{CallOpCallable, CallOpInterface, SymbolOpInterface};
 use pliron::builtin::ops::ModuleOp;
 use pliron::context::Context;
 use pliron::linked_list::ContainsLinkedList;
@@ -142,7 +142,7 @@ fn test_intrinsic_insertion() -> Result<(), anyhow::Error> {
 }
 
 #[test]
-fn test_globaltimer_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
+fn test_globaltimer_lowers_to_intrinsic_call() -> Result<(), anyhow::Error> {
     let mut ctx = Context::new();
     dialect_llvm::register(&mut ctx);
     dialect_mir::register(&mut ctx);
@@ -206,34 +206,63 @@ fn test_globaltimer_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
 
     mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let mut found_inline_asm = false;
+    const INTRINSIC: &str = "llvm_nvvm_read_ptx_sreg_globaltimer";
+
+    let mut found_decl = false;
+    let mut found_call = false;
     let module_op = module_ptr.deref(&ctx);
     let region = module_op.get_region(0);
     let block = region.deref(&ctx).iter(&ctx).next().unwrap();
 
     for op in block.deref(&ctx).iter(&ctx) {
-        if let Some(func_op) = Operation::get_op::<dialect_llvm::ops::FuncOp>(op, &ctx) {
-            if func_op.get_symbol_name(&ctx).to_string() != func_name {
-                continue;
-            }
+        let Some(func_op) = Operation::get_op::<dialect_llvm::ops::FuncOp>(op, &ctx) else {
+            continue;
+        };
+        let name = func_op.get_symbol_name(&ctx).to_string();
 
+        if name == INTRINSIC {
+            // Intrinsic declaration: present with empty body.
+            found_decl = true;
+            let num_regions = func_op.get_operation().deref(&ctx).regions().count();
+            if num_regions > 0 {
+                assert!(
+                    func_op
+                        .get_operation()
+                        .deref(&ctx)
+                        .get_region(0)
+                        .deref(&ctx)
+                        .iter(&ctx)
+                        .next()
+                        .is_none(),
+                    "intrinsic declaration must have empty body"
+                );
+            }
+        } else if name == func_name {
             let func_region = func_op.get_operation().deref(&ctx).get_region(0);
             for func_block in func_region.deref(&ctx).iter(&ctx) {
                 for body_op in func_block.deref(&ctx).iter(&ctx) {
-                    if let Some(inline_asm) = Operation::get_op::<llvm::InlineAsmOp>(body_op, &ctx)
-                        && inline_asm.asm_template(&ctx) == "mov.u64 $0, %globaltimer;"
+                    if let Some(call) = Operation::get_op::<llvm::CallOp>(body_op, &ctx)
+                        && let CallOpCallable::Direct(sym) = call.callee(&ctx)
+                        && sym.to_string() == INTRINSIC
                     {
-                        found_inline_asm = true;
-                        assert!(inline_asm.is_convergent(&ctx));
+                        found_call = true;
                     }
+                    assert!(
+                        Operation::get_op::<llvm::InlineAsmOp>(body_op, &ctx).is_none(),
+                        "globaltimer must not lower to inline asm"
+                    );
                 }
             }
         }
     }
 
     assert!(
-        found_inline_asm,
-        "Expected globaltimer inline asm in lowered kernel"
+        found_decl,
+        "Expected `{INTRINSIC}` declaration in lowered module"
+    );
+    assert!(
+        found_call,
+        "Expected call to `{INTRINSIC}` in lowered kernel body"
     );
     Ok(())
 }

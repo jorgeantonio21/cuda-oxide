@@ -13,7 +13,7 @@
 //! ├──────────────────────────┼──────────────────────────────┼─────────────────────────┤
 //! │ ReadPtxSregClockOp       │ %clock / read.ptx.sreg.clock │ 32-bit clock counter    │
 //! │ ReadPtxSregClock64Op     │ %clock64 / ...clock64        │ 64-bit clock counter    │
-//! │ ReadPtxSregGlobaltimerOp │ %globaltimer                 │ Global timer counter    │
+//! │ ReadPtxSregGlobaltimerOp │ %globaltimer / ...globaltimer│ Global timer counter    │
 //! │ TrapOp                   │ trap / llvm.nvvm.trap        │ Abort kernel execution  │
 //! │ BreakpointOp             │ brkpt / llvm.nvvm.brkpt      │ cuda-gdb breakpoint     │
 //! │ VprintfOp                │ vprintf / call @vprintf      │ Formatted output        │

@@ -122,7 +122,7 @@ pub fn clock64() -> u64 {
 /// ```
 #[inline(never)]
 pub fn globaltimer() -> u64 {
-    // Lowered to: inline PTX "mov.u64 ..., %globaltimer;"
+    // Lowered to: call i64 @llvm.nvvm.read.ptx.sreg.globaltimer()
     unreachable!("globaltimer called outside CUDA kernel context")
 }
 
