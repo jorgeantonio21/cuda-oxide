@@ -99,6 +99,8 @@ let (a_dev, b_dev, c_dev) = tokio::spawn(op.into_future()).await??;
 
 The owned form keeps device buffers alive until the CUDA stream reaches the
 kernel completion callback, then returns those buffers as the operation output.
+If an owned future is dropped after submission but before completion, the
+runtime synchronizes the assigned stream before releasing those resources.
 
 ## Buffer lifetime safety
 

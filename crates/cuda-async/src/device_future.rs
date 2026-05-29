@@ -27,6 +27,8 @@ use crate::device_operation::{DeviceOperation, ExecutionContext};
 use crate::error::DeviceError;
 use futures::task::AtomicWaker;
 use std::future::Future;
+use std::io::{self, Write};
+use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,6 +82,10 @@ impl StreamCallbackState {
 ///
 /// Constructed by [`SchedulingPolicy::schedule`] or by the [`IntoFuture`] impl
 /// on any `DeviceOperation`.
+///
+/// Dropping an in-flight future synchronizes its assigned stream before
+/// releasing the stored result so owned launch resources stay alive until the
+/// submitted GPU work has completed.
 ///
 /// [`SchedulingPolicy::schedule`]: crate::scheduling_policies::SchedulingPolicy::schedule
 /// [`IntoFuture`]: std::future::IntoFuture
@@ -150,6 +156,35 @@ impl<T: Send, DO: DeviceOperation<Output = T>> DeviceFuture<T, DO> {
         self.result = Some(out);
         Ok(())
     }
+
+    fn cleanup_executing_result_with<F>(&mut self, synchronize: F)
+    where
+        F: FnOnce() -> Result<(), DeviceError>,
+    {
+        if self.state != DeviceFutureState::Executing {
+            return;
+        }
+
+        let Some(result) = self.result.take() else {
+            return;
+        };
+
+        if let Err(error) = synchronize() {
+            let mut stderr = io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "cuda-async: leaking in-flight future result after cleanup failure: {}",
+                error
+            );
+            // If cleanup cannot prove the stream is idle, leaking the owned
+            // result is safer than dropping buffers that device work may still
+            // be using.
+            mem::forget(result);
+            return;
+        }
+
+        drop(result);
+    }
 }
 
 impl<T: Send, DO: DeviceOperation<Output = T>> Default for DeviceFuture<T, DO> {
@@ -168,6 +203,21 @@ impl<T: Send, DO: DeviceOperation<Output = T>> Default for DeviceFuture<T, DO> {
 /// `DeviceFuture` does not contain self-referential pointers, so it is safe
 /// to move.
 impl<T: Send, DO: DeviceOperation<Output = T>> Unpin for DeviceFuture<T, DO> {}
+
+impl<T: Send, DO: DeviceOperation<Output = T>> Drop for DeviceFuture<T, DO> {
+    fn drop(&mut self) {
+        self.cleanup_executing_result_with(|| {
+            let ctx = self.execution_context.as_ref().ok_or_else(|| {
+                DeviceError::Internal(
+                    "Cannot clean up an in-flight future without an execution context.".to_string(),
+                )
+            })?;
+            ctx.get_cuda_stream()
+                .synchronize()
+                .map_err(DeviceError::Driver)
+        });
+    }
+}
 
 /// State-machine implementation of [`Future`] for CUDA device work.
 ///
@@ -228,5 +278,108 @@ impl<T: Send, DO: DeviceOperation<Output = T>> Future for DeviceFuture<T, DO> {
             DeviceFutureState::Complete => panic!("Poll called after completion."),
             DeviceFutureState::Failed => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device_operation::Value;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct DropTracker {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropTracker {
+        fn drop(&mut self) {
+            self.events.lock().unwrap().push("drop");
+        }
+    }
+
+    #[test]
+    fn cleanup_executing_result_synchronizes_before_drop() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let tracker = DropTracker {
+            events: Arc::clone(&events),
+        };
+        let mut future: DeviceFuture<DropTracker, Value<DropTracker>> = DeviceFuture {
+            device_operation: None,
+            execution_context: None,
+            result: Some(tracker),
+            error: None,
+            state: DeviceFutureState::Executing,
+            callback_state: None,
+        };
+
+        future.cleanup_executing_result_with(|| {
+            events.lock().unwrap().push("sync");
+            Ok(())
+        });
+
+        assert_eq!(events.lock().unwrap().as_slice(), ["sync", "drop"]);
+        assert!(future.result.is_none());
+    }
+
+    #[test]
+    fn cleanup_executing_result_leaks_when_synchronize_fails() {
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        struct CountDrop(Arc<AtomicUsize>);
+
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut future: DeviceFuture<CountDrop, Value<CountDrop>> = DeviceFuture {
+            device_operation: None,
+            execution_context: None,
+            result: Some(CountDrop(Arc::clone(&drops))),
+            error: None,
+            state: DeviceFutureState::Executing,
+            callback_state: None,
+        };
+
+        future.cleanup_executing_result_with(|| Err(DeviceError::Internal("boom".to_string())));
+
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert!(future.result.is_none());
+    }
+
+    #[test]
+    fn cleanup_is_noop_for_idle_future() {
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        struct CountDrop(Arc<AtomicUsize>);
+
+        impl Drop for CountDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let mut future: DeviceFuture<CountDrop, Value<CountDrop>> = DeviceFuture {
+            device_operation: None,
+            execution_context: None,
+            result: Some(CountDrop(Arc::clone(&drops))),
+            error: None,
+            state: DeviceFutureState::Idle,
+            callback_state: None,
+        };
+
+        future.cleanup_executing_result_with(|| {
+            panic!("idle futures should not synchronize during cleanup")
+        });
+
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert!(future.result.is_some());
+
+        drop(future);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 }
