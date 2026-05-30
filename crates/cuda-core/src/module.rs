@@ -21,7 +21,7 @@
 use crate::context::CudaContext;
 use crate::error::{DriverError, IntoResult};
 use std::borrow::Cow;
-use std::ffi::CString;
+use std::ffi::{CString, c_void};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 
@@ -205,6 +205,190 @@ impl CudaModule {
             cu_function,
             module: self.clone(),
         })
+    }
+}
+
+/// A resolved handle to a `#[constant]` device global. Macro-generated
+/// `set_<name>` methods resolve these lazily on first use and cache the
+/// handle on the `LoadedModule` struct. Callers pass `size_of::<T>()` on
+/// every write; correctness depends on the resolver asserting that the
+/// driver-reported size matches the host-side type.
+#[derive(Clone, Copy, Debug)]
+pub struct ConstantHandle {
+    pub(crate) dptr: cuda_bindings::CUdeviceptr,
+}
+
+impl ConstantHandle {
+    /// Construct from a raw device pointer. Used by macro-generated
+    /// `LoadedModule` initializers after [`CudaModule::get_global`] has
+    /// resolved the symbol and the size has been asserted against
+    /// `size_of::<T>()`.
+    ///
+    /// # Safety
+    ///
+    /// `dptr` must point to at least `size_of::<T>()` bytes of constant
+    /// memory in a still-loaded module.
+    pub unsafe fn from_raw(dptr: cuda_bindings::CUdeviceptr) -> Self {
+        Self { dptr }
+    }
+}
+
+impl ConstantHandle {
+    /// Stream-ordered `cuMemcpyHtoDAsync` from `src` (`num_bytes` of host
+    /// memory) into the device global.
+    ///
+    /// # Safety
+    ///
+    /// - `src` must point to at least `num_bytes` of readable host memory.
+    /// - The bytes must have a layout compatible with the device-side type.
+    pub unsafe fn write_async(
+        &self,
+        stream: &crate::CudaStream,
+        src: *const u8,
+        num_bytes: usize,
+    ) -> Result<(), DriverError> {
+        stream.context().bind_to_thread()?;
+        unsafe { crate::memory::memcpy_htod_async(self.dptr, src, num_bytes, stream.cu_stream()) }
+    }
+
+    /// Stream-ordered `cuMemcpyHtoDAsync` from owned host bytes into the
+    /// device global.
+    ///
+    /// The bytes are kept alive until the stream reaches a host callback
+    /// enqueued after the copy. This makes safe setters sound even when the
+    /// caller passes a temporary such as `&3.0`.
+    pub fn write_async_staged(
+        &self,
+        stream: &crate::CudaStream,
+        bytes: Box<[MaybeUninit<u8>]>,
+    ) -> Result<(), DriverError> {
+        stream.context().bind_to_thread()?;
+        let num_bytes = bytes.len();
+        if num_bytes == 0 {
+            return Ok(());
+        }
+
+        unsafe {
+            crate::memory::memcpy_htod_async(
+                self.dptr,
+                bytes.as_ptr() as *const u8,
+                num_bytes,
+                stream.cu_stream(),
+            )?;
+        }
+
+        unsafe extern "C" fn drop_staged_bytes(callback: *mut c_void) {
+            drop(unsafe {
+                Box::<Box<[MaybeUninit<u8>]>>::from_raw(callback as *mut Box<[MaybeUninit<u8>]>)
+            });
+        }
+
+        let callback_data = Box::into_raw(Box::new(bytes)) as *mut c_void;
+        let callback_result = unsafe {
+            cuda_bindings::cuLaunchHostFunc(
+                stream.cu_stream(),
+                Some(drop_staged_bytes),
+                callback_data,
+            )
+        }
+        .result();
+
+        if let Err(err) = callback_result {
+            let staged = unsafe {
+                Box::<Box<[MaybeUninit<u8>]>>::from_raw(
+                    callback_data as *mut Box<[MaybeUninit<u8>]>,
+                )
+            };
+            if let Err(sync_err) = stream.synchronize() {
+                Box::leak(staged);
+                return Err(sync_err);
+            }
+            drop(staged);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Synchronous `cuMemcpyHtoD` from `src` into the device global. Blocks
+    /// the calling thread.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`write_async`](Self::write_async).
+    pub unsafe fn write_blocking(
+        &self,
+        module: &Arc<CudaModule>,
+        src: *const u8,
+        num_bytes: usize,
+    ) -> Result<(), DriverError> {
+        unsafe { module.copy_bytes_to_device_global_sync(self.dptr, src, num_bytes) }
+    }
+}
+
+impl CudaModule {
+    /// Resolves a device global by name and returns its device pointer and
+    /// size in bytes.
+    ///
+    /// Used to find `__constant__`-style globals (and other module-scope
+    /// device symbols) so the host can populate them via `cuMemcpyHtoD`.
+    /// The returned size is what the driver recorded for the symbol — host
+    /// code should assert it matches the expected element size before
+    /// copying.
+    ///
+    /// Binds the owning context to the calling thread first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding fails or if `name` cannot be resolved
+    /// in this module.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` contains interior null bytes.
+    pub fn get_global(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Result<(cuda_bindings::CUdeviceptr, usize), DriverError> {
+        self.ctx.bind_to_thread()?;
+        let c_name = CString::new(name).unwrap();
+        let mut dptr = MaybeUninit::<cuda_bindings::CUdeviceptr>::uninit();
+        let mut size = MaybeUninit::<usize>::uninit();
+        unsafe {
+            cuda_bindings::cuModuleGetGlobal_v2(
+                dptr.as_mut_ptr(),
+                size.as_mut_ptr(),
+                self.cu_module,
+                c_name.as_ptr(),
+            )
+            .result()?;
+            Ok((dptr.assume_init(), size.assume_init()))
+        }
+    }
+
+    /// Synchronously copies `num_bytes` from host memory at `src` into the
+    /// device global at `dptr`.
+    ///
+    /// Intended for populating `#[constant]` statics from the macro-generated
+    /// `set_<name>_blocking` methods on `LoadedModule`. The caller is expected to have
+    /// already resolved `dptr` via [`get_global`](Self::get_global) and
+    /// verified that the driver-reported size matches the host type's size.
+    ///
+    /// # Safety
+    ///
+    /// - `dptr` must be a valid device pointer with at least `num_bytes` of
+    ///   accessible storage.
+    /// - `src` must point to at least `num_bytes` of readable host memory.
+    /// - The device-side type at `dptr` and the host bytes at `src` must
+    ///   have compatible layout.
+    pub unsafe fn copy_bytes_to_device_global_sync(
+        self: &Arc<Self>,
+        dptr: cuda_bindings::CUdeviceptr,
+        src: *const u8,
+        num_bytes: usize,
+    ) -> Result<(), DriverError> {
+        self.ctx.bind_to_thread()?;
+        unsafe { crate::memory::memcpy_htod_sync(dptr, src, num_bytes) }
     }
 }
 
