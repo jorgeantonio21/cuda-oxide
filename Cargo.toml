@@ -36,15 +36,18 @@ repository = "https://github.com/NVlabs/cuda-oxide.git"
 # Examples are in: crates/rustc-codegen-cuda/examples/
 
 [workspace.dependencies]
-# Pliron MLIR framework
-# TEMP (pliron-llvm migration): local path dep to the `cuda-oxide-llvm-additions`
-# branch in ../../dev/pliron for fast iteration. Flip back to a fork git-rev
-# (keeping `crates/rustc-codegen-cuda/Cargo.toml` on the same rev) before
-# committing. pliron-llvm uses default-features = false to keep llvm-sys (LLVM
-# 22) out; cuda-oxide consumes the dialect modeling only, not the FFI bridge.
-pliron = { path = "/home/nihalp/dev/pliron" }
-pliron-derive = { path = "/home/nihalp/dev/pliron/pliron-derive" }
-pliron-llvm = { path = "/home/nihalp/dev/pliron/pliron-llvm", default-features = false }
+# Pliron MLIR framework.
+# Pinned to the `cuda-oxide-llvm-additions` branch on the fork
+# (https://github.com/nihalpasham/pliron), which stacks the additions cuda-oxide
+# needs (address spaces, atomics, inline asm, FP16, stronger verification) on top
+# of upstream pliron. pliron-llvm uses default-features = false to keep llvm-sys
+# (LLVM 22) out: cuda-oxide consumes the dialect modeling only, not the FFI
+# bridge. `crates/rustc-codegen-cuda/Cargo.toml` MUST stay on this same rev, or
+# pliron resolves to two distinct crates and types stop unifying. Bump the rev if
+# that branch is amended during review.
+pliron = { git = "https://github.com/nihalpasham/pliron", rev = "c239bd64c5d870631611ab8b346f421c02312e95" }
+pliron-derive = { git = "https://github.com/nihalpasham/pliron", rev = "c239bd64c5d870631611ab8b346f421c02312e95" }
+pliron-llvm = { git = "https://github.com/nihalpasham/pliron", rev = "c239bd64c5d870631611ab8b346f421c02312e95", default-features = false }
 
 # Internal crates
 dialect-llvm = { path = "crates/dialect-llvm" }
