@@ -496,10 +496,7 @@ pub fn translate_type(
 
                             // Total struct size (bytes)
                             let size: u64 = shape.size.bytes() as u64;
-                            // True ABI alignment (captures repr(align(N)) raises)
-                            let align: u64 = shape.abi_align as u64;
-
-                            (mem_order, offsets, size, align)
+                            (mem_order, offsets, size, shape.abi_align)
                         } else {
                             (vec![], vec![], 0u64, 0u64)
                         };
@@ -599,7 +596,7 @@ pub fn translate_type(
                         mem_to_decl,
                         field_offsets,
                         shape.size.bytes() as u64,
-                        shape.abi_align as u64,
+                        shape.abi_align,
                     )
                 } else {
                     (vec![], vec![], 0, 0)
