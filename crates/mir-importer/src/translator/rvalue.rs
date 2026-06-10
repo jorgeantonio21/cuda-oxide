@@ -806,8 +806,8 @@ pub fn translate_rvalue(
                 // the partial field address. That miscompiled places like
                 // `&(*ptr).0[i]` to the address of slot 0, dropping `i`
                 // entirely — see closure_index_miscompile example.
-                if place.projection.len() > 2
-                    && let Some((tail_val, tail_last)) = translate_place_addr_from_slot(
+                if place.projection.len() > 2 {
+                    return match translate_place_addr_from_slot(
                         ctx,
                         body,
                         value_map,
@@ -817,9 +817,26 @@ pub fn translate_rvalue(
                         block_ptr,
                         last_inserted,
                         loc.clone(),
-                    )?
-                {
-                    return Ok((None, tail_val, tail_last));
+                    )? {
+                        Some((tail_val, tail_last)) => Ok((None, tail_val, tail_last)),
+                        // The tail contains a projection the address walker
+                        // cannot lower (e.g. Deref, Downcast, Subslice, a
+                        // from-end ConstantIndex, or indexing a non-array
+                        // pointee). Returning the partial field address here
+                        // would hand out a pointer to the WRONG element --
+                        // exactly the issue #120 miscompile, where a dropped
+                        // `Index` made every access read slot 0. Refuse
+                        // loudly instead of emitting a wrong address.
+                        None => input_err!(
+                            loc,
+                            TranslationErr::unsupported(format!(
+                                "Rvalue::Ref: cannot lower tail projection {:?} of place {:?} \
+                                 to an address; refusing to emit a partial field address",
+                                &place.projection[2..],
+                                place
+                            ))
+                        ),
+                    };
                 }
 
                 return Ok((None, result_val, last_inserted));
@@ -3125,14 +3142,15 @@ fn apply_enum_field_projection(
 /// - `Field(idx, _)`   → [`MirFieldAddrOp`]
 /// - `ConstantIndex {offset, from_end: false, ..}` → `MirConstantOp` + [`MirArrayElementAddrOp`]
 /// - `Index(local)`    → `load_local(local)` + [`MirArrayElementAddrOp`]
-/// - `Deref`           → load the pointer; subsequent projections apply to
-///   the pointee.
+///
+/// `Deref`, `Downcast`, `Subslice` and from-end `ConstantIndex` are NOT
+/// handled; the walker punts on them (returns `Ok(None)`).
 ///
 /// Returns `Ok(Some((addr, last_op)))` on success, `Ok(None)` if the
 /// projection chain contains an element this helper doesn't know how to
-/// turn into an address (the caller falls back to `MirRefOp`), or `Err` if
-/// something structurally invalid happens (wrong pointee kind, unsupported
-/// type).
+/// turn into an address (the caller decides whether a value fallback is
+/// sound or the construct must be rejected), or `Err` if something
+/// structurally invalid happens (wrong pointee kind, unsupported type).
 ///
 /// `is_mutable` governs the mutability of intermediate pointer types; the
 /// final result pointer also carries this mutability.
