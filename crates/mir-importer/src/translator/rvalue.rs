@@ -3387,9 +3387,9 @@ fn apply_enum_field_projection(
 /// mut pointers: writes through a copy are silently lost).
 ///
 /// Also used by statement translation to compute the destination address
-/// of deeply projected assignments (3+ projection elements), where the
-/// same "walk the chain, then act through the address" logic applies with
-/// a store instead of a borrow.
+/// of projected assignments (indexed `(*ptr)[i]` writes and 3+ element
+/// projection chains), where the same "walk the chain, then act through
+/// the address" logic applies with a store instead of a borrow.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn translate_place_address(
     ctx: &mut Context,
@@ -3424,11 +3424,16 @@ pub(crate) fn translate_place_address(
 ///
 /// - `Field(idx, _)`   → [`MirFieldAddrOp`]
 /// - `ConstantIndex {offset, from_end: false, ..}` → `MirConstantOp` + [`MirArrayElementAddrOp`]
+///   (array pointee) or `MirConstantOp` + [`MirPtrOffsetOp`] (slice data pointer)
 /// - `Index(local)`    → `load_local(local)` + [`MirArrayElementAddrOp`]
+///   (array pointee) or `load_local(local)` + [`MirPtrOffsetOp`] (slice data pointer)
 /// - `Deref`           → `MirLoadOp` of the pointer (the loaded pointer IS
 ///   the pointee's address); subsequent projections apply to the pointee.
-///   ZST pointees skip the load (SharedArray exception) and fat
-///   (slice-shaped) pointees are never walked through -- see the arm.
+///   ZST pointees skip the load (SharedArray exception). Fat (slice-shaped)
+///   pointees scalarize to a (data ptr, len) pair: a mid-chain fat deref
+///   loads the whole fat value and extracts the thin data pointer (field 0)
+///   so the walk continues against the ORIGINAL elements, while a trailing
+///   fat deref (`&*s` reborrow) is just a load of the fat value.
 ///
 /// `Downcast` (enum payload addressing; issues #131/#146), `Subslice` and
 /// from-end `ConstantIndex` are NOT handled; the walker punts on them
@@ -3477,22 +3482,22 @@ fn translate_place_addr_from_slot(
                         None => return Ok(None),
                     }
                 };
-                let (pointee_is_zst_tuple, pointee_is_thin_ptr, pointee_is_fat, fat_slice_elem) = {
+                let (pointee_is_zst_tuple, pointee_is_thin_ptr, fat_elem_ty) = {
                     let p_ref = place_ty.deref(ctx);
                     let is_zst_tuple = p_ref
                         .downcast_ref::<dialect_mir::types::MirTupleType>()
                         .is_some_and(|tt| tt.get_types().is_empty());
                     let is_thin_ptr = p_ref.is::<dialect_mir::types::MirPtrType>();
-                    let is_fat = p_ref.is::<dialect_mir::types::MirSliceType>()
-                        || p_ref.is::<dialect_mir::types::MirDisjointSliceType>();
-                    // For plain `MirSliceType` fat values we know how to
-                    // continue the walk through the deref (see below); record
-                    // the element type. `MirDisjointSliceType` keeps the old
-                    // punt behaviour.
-                    let slice_elem = p_ref
+                    // Slice-shaped (fat) pointees carry their element type.
+                    let fat_elem_ty = p_ref
                         .downcast_ref::<dialect_mir::types::MirSliceType>()
-                        .map(|s| s.element_type());
-                    (is_zst_tuple, is_thin_ptr, is_fat, slice_elem)
+                        .map(|st| st.element_type())
+                        .or_else(|| {
+                            p_ref
+                                .downcast_ref::<dialect_mir::types::MirDisjointSliceType>()
+                                .map(|st| st.element_type())
+                        });
+                    (is_zst_tuple, is_thin_ptr, fat_elem_ty)
                 };
 
                 if pointee_is_zst_tuple {
@@ -3506,33 +3511,36 @@ fn translate_place_addr_from_slot(
                 }
 
                 let is_last = proj_idx + 1 == projection.len();
-                if pointee_is_fat {
-                    // Fat values are a (data pointer, element count) pair;
-                    // dereferencing THROUGH them with a single `mir.load`
-                    // would treat the pair as a thin address -- a silent
-                    // miscompile -- so we never do that. What we CAN do:
+                if let Some(elem_ty) = fat_elem_ty {
+                    // Fat values (`&[T]`, `DisjointSlice<T>`, fat references
+                    // to slice-tailed structs) are a (data pointer, element
+                    // count) pair; dereferencing THROUGH them with a single
+                    // `mir.load` would treat the pair as a thin address, a
+                    // silent miscompile, so we never do that. What we CAN do:
                     //
                     // - Trailing `&*s` reborrow (the deref is the last
                     //   projection): the borrow result IS the fat value,
                     //   which lives whole in the slot, so the plain load
                     //   below is exactly right.
                     //
-                    // - For `MirSliceType` fat values whose next projection
-                    //   we understand, continue the walk by hand: load the
-                    //   fat PAIR, extract its data pointer (field 0), and
-                    //   process the following projection against that
-                    //   pointer. This covers field access through a fat
-                    //   reference to a slice-tailed struct (the
-                    //   `(*iter).alive.start` accesses inside
-                    //   `core::array::IntoIter::next`, issue #138) and
-                    //   element access through a slice reference
-                    //   (`(*slice)[i]`).
+                    // - When the next projection is one we understand,
+                    //   continue the walk by hand: load the fat PAIR,
+                    //   extract its data pointer (field 0), and process the
+                    //   following projection against that pointer. The data
+                    //   pointer addresses the ORIGINAL elements, so both
+                    //   shared and mutable borrows stay sound. This covers
+                    //   field access through a fat reference to a
+                    //   slice-tailed struct (the `(*iter).alive.start`
+                    //   accesses inside `core::array::IntoIter::next`,
+                    //   issue #138) and element access through a slice
+                    //   reference (`(*slice)[i]`, including the inlined
+                    //   body of `slice::get_mut`, issue #58).
                     //
                     // - Anything else keeps the loud failure (mutable) or
                     //   the value-copy fallback (shared).
                     if is_last {
                         // Fall through to the load below.
-                    } else if let Some(elem_ty) = fat_slice_elem {
+                    } else {
                         // Load the fat (ptr, len) pair from the slot.
                         let fat_load = Operation::new(
                             ctx,
@@ -3552,7 +3560,7 @@ fn translate_place_addr_from_slot(
                         // Extract the data pointer (field 0 of the pair).
                         // Its pointee is the slice's element type: the
                         // struct itself for a fat struct reference, or the
-                        // element for an ordinary `&[T]`.
+                        // element for an ordinary `&[T]` / `DisjointSlice`.
                         let data_ptr_ty: Ptr<TypeObj> =
                             dialect_mir::types::MirPtrType::get_generic(ctx, elem_ty, is_mutable)
                                 .into();
@@ -3652,7 +3660,10 @@ fn translate_place_addr_from_slot(
 
                         match &projection[proj_idx + 1] {
                             // Sized field or element access: hand the data
-                            // pointer to the matching arm of this loop.
+                            // pointer to the matching arm of this loop. The
+                            // following `Index` / `ConstantIndex` offsets it
+                            // directly (its pointee is the element type, not
+                            // an array), see `emit_indexed_element_addr`.
                             mir::ProjectionElem::Field(..)
                             | mir::ProjectionElem::Index(_)
                             | mir::ProjectionElem::ConstantIndex {
@@ -3678,21 +3689,6 @@ fn translate_place_addr_from_slot(
                                 return Ok(None);
                             }
                         }
-                    } else if is_mutable {
-                        return input_err!(
-                            loc,
-                            TranslationErr::unsupported(format!(
-                                "cannot compute a mutable in-memory address through \
-                                 fat-pointer deref (projection {:?}); slices scalarize \
-                                 to (ptr, len) and a single load would misread the \
-                                 fat value as a thin address",
-                                projection
-                            ))
-                        );
-                    } else {
-                        // Shared borrow: let the caller fall back to a value
-                        // copy, which is sound for reads.
-                        return Ok(None);
                     }
                 } else if !pointee_is_thin_ptr {
                     // Deref of a non-pointer-typed place (a type the
@@ -3851,11 +3847,18 @@ fn translate_place_addr_from_slot(
     Ok(Some((current, current_prev_op)))
 }
 
-/// Describes what a pointer points to (array vs. other) for address-computation
-/// dispatch.
+/// Describes what a pointer points to (array vs. anything else) for
+/// address-computation dispatch.
 enum PointeeKind {
+    /// Pointee is `[T; N]` (carries `T`). Element addressing GEPs through
+    /// the array type via `mir.array_element_addr`.
     Array(Ptr<TypeObj>),
-    Other,
+    /// Pointee is any other type. When an `Index` / `ConstantIndex`
+    /// projection meets such a pointer, MIR typing guarantees the indexed
+    /// place is a slice whose data pointer (produced by the fat-pointer
+    /// `Deref` arm) points directly at the elements, so element addressing
+    /// is a plain `mir.ptr_offset` keeping the pointer's own type.
+    Direct,
 }
 
 /// Emit the address of element `index_val` behind `current`, which is either
@@ -3891,7 +3894,7 @@ fn emit_indexed_element_addr(
                 0,
             )
         }
-        PointeeKind::Other => {
+        PointeeKind::Direct => {
             // The pointee IS the element type, so indexing is plain
             // element-size pointer arithmetic and the result keeps the
             // pointer's own type.
@@ -3928,7 +3931,7 @@ fn pointer_pointee_kind(ctx: &Context, ptr_value: Value) -> Option<(PointeeKind,
     {
         PointeeKind::Array(arr_ty.element_type())
     } else {
-        PointeeKind::Other
+        PointeeKind::Direct
     };
     Some((kind, addr_space))
 }
