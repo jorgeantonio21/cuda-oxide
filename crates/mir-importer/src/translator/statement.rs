@@ -20,11 +20,16 @@
 //!
 //! # Projections
 //!
-//! Handles up to 2-level projections:
+//! 1- and 2-level projections have dedicated arms:
 //! - `*ptr` → Store through pointer
 //! - `s.field` → Field-address from the slot, then `mir.store`
 //! - `(*ptr).field` → Load pointer, compute field address, store
 //! - `s.outer.inner` → Chained field-address from the slot, then store
+//!
+//! Deeper chains (e.g. `(*iter).alive.start` from the `for x in arr`
+//! loop machinery) are handled generically: the full projection list is
+//! walked to a destination address with the same place-address walker
+//! that `Rvalue::Ref` uses, then a single `mir.store` writes through it.
 
 use super::types;
 use crate::error::{TranslationErr, TranslationResult};
@@ -616,13 +621,66 @@ pub fn translate_statement(
                     ),
                 }
             } else {
-                input_err!(
-                    loc,
-                    TranslationErr::unsupported(format!(
-                        "Complex places ({} projections) not yet implemented",
-                        place.projection.len()
-                    ))
-                )
+                // 3+ projections, e.g. `(*iter).alive.start = value` from the
+                // inlined `IndexRange::next_unchecked` inside
+                // `core::array::IntoIter`'s `next` (the `for x in arr` loop
+                // machinery, issue #138). Instead of enumerating every
+                // combination by hand like the 1- and 2-level arms above, walk
+                // the full projection chain to a destination address with the
+                // same walker that `Rvalue::Ref` uses, then store through it.
+                let mut current_prev = prev_op;
+                if let Some(rvalue_op) = rvalue_op_opt {
+                    if let Some(prev) = last_inserted {
+                        rvalue_op.insert_after(ctx, prev);
+                    } else if let Some(prev) = prev_op {
+                        rvalue_op.insert_after(ctx, prev);
+                    } else {
+                        rvalue_op.insert_at_front(block_ptr, ctx);
+                    }
+                    current_prev = Some(rvalue_op);
+                } else if let Some(prev) = last_inserted {
+                    current_prev = Some(prev);
+                }
+
+                let walked = rvalue::translate_place_address(
+                    ctx,
+                    body,
+                    value_map,
+                    place,
+                    /* is_mutable */ true,
+                    block_ptr,
+                    current_prev,
+                    loc.clone(),
+                )?;
+                let Some((dest_addr, addr_prev)) = walked else {
+                    // The walker punted (an element it cannot turn into an
+                    // address, or the local has no slot). Writes must not
+                    // fall back to a value copy, so reject loudly.
+                    return input_err!(
+                        loc,
+                        TranslationErr::unsupported(format!(
+                            "Complex places ({} projections) not yet implemented",
+                            place.projection.len()
+                        ))
+                    );
+                };
+                current_prev = addr_prev.or(current_prev);
+
+                let store_op = Operation::new(
+                    ctx,
+                    MirStoreOp::get_concrete_op_info(),
+                    vec![],
+                    vec![dest_addr, result_value],
+                    vec![],
+                    0,
+                );
+                store_op.deref_mut(ctx).set_loc(loc);
+                if let Some(prev) = current_prev {
+                    store_op.insert_after(ctx, prev);
+                } else {
+                    store_op.insert_at_front(block_ptr, ctx);
+                }
+                Ok(Some(store_op))
             }
         }
         mir::StatementKind::StorageLive(_local) => {
