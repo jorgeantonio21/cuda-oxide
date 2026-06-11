@@ -84,7 +84,8 @@
 //! Because the bytes match rustc exactly, enum data can cross the
 //! host/device boundary safely. The tag slot stores the variant's
 //! DECLARED discriminant value (`enum E { A = 7 }` stores 7), not its
-//! position. See [`build_enum_slot_map`] for the full story.
+//! position. See `build_enum_slot_map` in this module for the full
+//! story.
 //!
 //! # Function Type Conversion
 //!
@@ -720,7 +721,15 @@ pub(crate) fn build_enum_slot_map(
     ctx: &mut Context,
     ty: Ptr<TypeObj>,
 ) -> Result<EnumSlotMap, anyhow::Error> {
-    let (name, discriminant_ty, all_field_types, all_field_offsets, tag_offset, total_size, abi_align) = {
+    let (
+        name,
+        discriminant_ty,
+        all_field_types,
+        all_field_offsets,
+        tag_offset,
+        total_size,
+        abi_align,
+    ) = {
         let ty_ref = ty.deref(ctx);
         let enum_ty = ty_ref
             .downcast_ref::<MirEnumType>()
@@ -926,14 +935,10 @@ pub(crate) fn convert_enum_to_llvm(
 /// for the two sides to disagree about.
 ///
 /// Returns the enum's name when its bytes are unmodeled, else `None`.
-pub(crate) fn enum_unmodeled_in_memory(
-    ctx: &Context,
-    ty: Ptr<TypeObj>,
-) -> Option<String> {
+pub(crate) fn enum_unmodeled_in_memory(ctx: &Context, ty: Ptr<TypeObj>) -> Option<String> {
     let ty_ref = ty.deref(ctx);
     let enum_ty = ty_ref.downcast_ref::<MirEnumType>()?;
-    (enum_ty.total_size() == 0 && enum_ty.variant_count() > 1)
-        .then(|| enum_ty.name().to_string())
+    (enum_ty.total_size() == 0 && enum_ty.variant_count() > 1).then(|| enum_ty.name().to_string())
 }
 
 /// Search a kernel parameter's type for an enum the host and device

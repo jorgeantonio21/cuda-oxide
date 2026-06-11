@@ -554,12 +554,8 @@ fn enum_byte_gep(
 ) -> Value {
     use llvm_export::ops::GepIndex;
     let i8_ty: Ptr<TypeObj> = IntegerType::get(ctx, 8, Signedness::Signless).into();
-    let gep_op = llvm::GetElementPtrOp::new(
-        ctx,
-        base,
-        vec![GepIndex::Constant(offset as u32)],
-        i8_ty,
-    );
+    let gep_op =
+        llvm::GetElementPtrOp::new(ctx, base, vec![GepIndex::Constant(offset as u32)], i8_ty);
     rewriter.insert_operation(ctx, gep_op.get_operation());
     gep_op.get_operation().deref(ctx).get_result(0)
 }
@@ -695,8 +691,7 @@ pub(crate) fn convert_construct_enum(
         };
         match slot {
             Some(slot) => {
-                let insert_op =
-                    llvm::InsertValueOp::new(ctx, current_struct, operand, vec![*slot]);
+                let insert_op = llvm::InsertValueOp::new(ctx, current_struct, operand, vec![*slot]);
                 rewriter.insert_operation(ctx, insert_op.get_operation());
                 current_struct = insert_op.get_operation().deref(ctx).get_result(0);
                 last_op = insert_op.get_operation();
@@ -863,15 +858,9 @@ pub(crate) fn convert_enum_payload(
             rewriter.replace_operation(ctx, op, undef_op.get_operation());
         }
         None => {
-            let slot_ptr = spill_enum_value(
-                ctx,
-                rewriter,
-                enum_val,
-                slot_map.llvm_struct_ty,
-                abi_align,
-            );
-            let field_ptr =
-                enum_byte_gep(ctx, rewriter, slot_ptr, slot_map.field_offsets[flat]);
+            let slot_ptr =
+                spill_enum_value(ctx, rewriter, enum_val, slot_map.llvm_struct_ty, abi_align);
+            let field_ptr = enum_byte_gep(ctx, rewriter, slot_ptr, slot_map.field_offsets[flat]);
             let load_op = llvm::LoadOp::new(ctx, field_ptr, slot_map.field_llvm_types[flat]);
             rewriter.insert_operation(ctx, load_op.get_operation());
             rewriter.replace_operation(ctx, op, load_op.get_operation());
