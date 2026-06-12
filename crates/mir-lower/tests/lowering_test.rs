@@ -744,8 +744,7 @@ fn assert_inline_asm_lowering(
         let func_region = func_op.get_operation().deref(ctx).get_region(0);
         for func_block in func_region.deref(ctx).iter(ctx) {
             for body_op in func_block.deref(ctx).iter(ctx) {
-                if let Some(inline_asm) =
-                    Operation::get_op::<llvm::InlineAsmOp>(body_op, ctx)
+                if let Some(inline_asm) = Operation::get_op::<llvm::InlineAsmOp>(body_op, ctx)
                     && inline_asm
                         .get_attr_inline_asm_template(ctx)
                         .is_some_and(|s| String::from((*s).clone()).contains(expected_asm))
@@ -835,8 +834,7 @@ fn test_cvt_f16x2_f32_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
     let mut ctx = make_test_ctx();
     let f32_ty = FP32Type::get(&mut ctx);
     let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
-    let (module_ptr, entry) =
-        build_test_kernel(&mut ctx, vec![f32_ty.into(), f32_ty.into()]);
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![f32_ty.into(), f32_ty.into()]);
 
     let lo_val = entry.deref(&ctx).get_argument(0);
     let hi_val = entry.deref(&ctx).get_argument(1);
