@@ -207,21 +207,44 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
     /// the next synchronization point on `stream`). For pageable host memory
     /// the driver may internally synchronize; use pinned memory for true
     /// async overlap.
+    ///
+    /// An empty `data` slice yields an empty buffer without touching the
+    /// driver allocator.
+    ///
+    /// # Allocation safety on error
+    ///
+    /// The returned buffer takes ownership of the device allocation
+    /// immediately after `malloc_sync`, before the fallible
+    /// `memcpy_htod_async` enqueue runs. If the enqueue fails, the early
+    /// return drops the buffer and its `Drop` impl frees the allocation, so
+    /// no device memory is leaked.
     pub fn from_host(stream: &CudaStream, data: &[T]) -> Result<Self, DriverError> {
         let ctx = stream.context().clone();
         let len = data.len();
         let num_bytes = std::mem::size_of_val(data);
 
-        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
-        unsafe {
-            crate::memory::memcpy_htod_async(ptr, data.as_ptr(), num_bytes, stream.cu_stream())?;
+        // cuMemAlloc rejects zero-byte requests with CUDA_ERROR_INVALID_VALUE,
+        // so represent an empty buffer as a null pointer (Drop skips it).
+        if num_bytes == 0 {
+            // SAFETY: a null pointer with zero bytes is never dereferenced
+            // and Drop ignores it.
+            return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
         }
-        Ok(Self {
-            ptr,
-            len,
-            ctx,
-            _marker: PhantomData,
-        })
+
+        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
+        // SAFETY: `ptr` was just allocated with `num_bytes` bytes in the
+        // stream's context; ownership transfers to `buf` here so any early
+        // return below frees it through the buffer's own `Drop`.
+        let buf = unsafe { Self::from_raw_parts(ptr, len, ctx) };
+        unsafe {
+            crate::memory::memcpy_htod_async(
+                buf.ptr,
+                data.as_ptr(),
+                num_bytes,
+                stream.cu_stream(),
+            )?;
+        }
+        Ok(buf)
     }
 
     /// Allocates device memory and enqueues a host-to-device copy from a
@@ -265,22 +288,38 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
 
     /// Allocates zero-initialized device memory of `len` elements, enqueued
     /// on `stream`.
+    ///
+    /// A `len` of zero (or a zero-sized `T`) yields an empty buffer without
+    /// touching the driver allocator.
+    ///
+    /// # Allocation safety on error
+    ///
+    /// The returned buffer takes ownership of the device allocation
+    /// immediately after `malloc_sync`, before the fallible
+    /// `memset_d8_async` enqueue runs. If the enqueue fails, the early
+    /// return drops the buffer and its `Drop` impl frees the allocation, so
+    /// no device memory is leaked.
     pub fn zeroed(stream: &CudaStream, len: usize) -> Result<Self, DriverError> {
         let ctx = stream.context().clone();
         let num_bytes = len * std::mem::size_of::<T>();
 
-        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
-        if num_bytes > 0 {
-            unsafe {
-                crate::memory::memset_d8_async(ptr, 0, num_bytes, stream.cu_stream())?;
-            }
+        // cuMemAlloc rejects zero-byte requests with CUDA_ERROR_INVALID_VALUE,
+        // so represent an empty buffer as a null pointer (Drop skips it).
+        if num_bytes == 0 {
+            // SAFETY: a null pointer with zero bytes is never dereferenced
+            // and Drop ignores it.
+            return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
         }
-        Ok(Self {
-            ptr,
-            len,
-            ctx,
-            _marker: PhantomData,
-        })
+
+        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
+        // SAFETY: `ptr` was just allocated with `num_bytes` bytes in the
+        // stream's context; ownership transfers to `buf` here so any early
+        // return below frees it through the buffer's own `Drop`.
+        let buf = unsafe { Self::from_raw_parts(ptr, len, ctx) };
+        unsafe {
+            crate::memory::memset_d8_async(buf.ptr, 0, num_bytes, stream.cu_stream())?;
+        }
+        Ok(buf)
     }
 
     /// Copies the entire buffer back to the host, returning a `Vec<T>`.

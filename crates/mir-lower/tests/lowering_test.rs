@@ -713,3 +713,301 @@ fn test_cmp_predicate_lowering() -> Result<(), anyhow::Error> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Helper: build a void-returning kernel with a single NVVM op, lower it, and
+// assert the kernel body contains an InlineAsmOp whose template includes the
+// given `expected_asm` substring.
+// ---------------------------------------------------------------------------
+
+/// Build a kernel whose entry block contains `op` + `mir.return`, lower to LLVM,
+/// and verify an `InlineAsmOp` with `expected_asm` in its template exists.
+fn assert_inline_asm_lowering(
+    ctx: &mut Context,
+    module_ptr: pliron::context::Ptr<Operation>,
+    expected_asm: &str,
+) -> Result<(), anyhow::Error> {
+    mir_lower::lower_mir_to_llvm(ctx, module_ptr).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let mut found = false;
+    let module_op = module_ptr.deref(ctx);
+    let region = module_op.get_region(0);
+    let block = region.deref(ctx).iter(ctx).next().unwrap();
+
+    for op in block.deref(ctx).iter(ctx) {
+        let Some(func_op) = Operation::get_op::<llvm::FuncOp>(op, ctx) else {
+            continue;
+        };
+        if func_op.get_symbol_name(ctx).to_string() != "kernel_func" {
+            continue;
+        }
+        let func_region = func_op.get_operation().deref(ctx).get_region(0);
+        for func_block in func_region.deref(ctx).iter(ctx) {
+            for body_op in func_block.deref(ctx).iter(ctx) {
+                if let Some(inline_asm) = Operation::get_op::<llvm::InlineAsmOp>(body_op, ctx)
+                    && inline_asm
+                        .get_attr_inline_asm_template(ctx)
+                        .is_some_and(|s| String::from((*s).clone()).contains(expected_asm))
+                {
+                    found = true;
+                }
+            }
+        }
+    }
+
+    assert!(
+        found,
+        "Expected inline asm containing `{expected_asm}` in lowered kernel"
+    );
+    Ok(())
+}
+
+/// Helper: fresh context with all dialects registered.
+fn make_test_ctx() -> Context {
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+    dialect_nvvm::register(&mut ctx);
+    mir_lower::register(&mut ctx);
+    ctx
+}
+
+/// Helper: build a module + MirFuncOp("kernel_func") with given arg types,
+/// returning the module ptr and entry block.
+fn build_test_kernel(
+    ctx: &mut Context,
+    arg_tys: Vec<pliron::context::Ptr<pliron::r#type::TypeObj>>,
+) -> (
+    pliron::context::Ptr<Operation>,
+    pliron::context::Ptr<pliron::basic_block::BasicBlock>,
+) {
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::attributes::TypeAttr;
+    use pliron::builtin::types::FunctionType;
+
+    let module = ModuleOp::new(ctx, "test_module".try_into().unwrap());
+    let module_ptr = module.get_operation();
+
+    let func_ty = FunctionType::get(ctx, arg_tys.clone(), vec![]);
+    let func_op_ptr = Operation::new(
+        ctx,
+        mir::MirFuncOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        1,
+    );
+    let func = mir::MirFuncOp::new(ctx, func_op_ptr, TypeAttr::new(func_ty.into()));
+    func.set_symbol_name(ctx, "kernel_func".try_into().unwrap());
+
+    let region = func.get_operation().deref(ctx).get_region(0);
+    let entry = BasicBlock::new(ctx, None, arg_tys);
+    entry.insert_at_back(region, ctx);
+
+    let module_region = module_ptr.deref(ctx).get_region(0);
+    let module_block = module_region.deref(ctx).iter(ctx).next().unwrap();
+    func.get_operation().insert_at_back(module_block, ctx);
+
+    (module_ptr, entry)
+}
+
+/// Helper: append a mir.return (void) to a block.
+fn append_return(ctx: &mut Context, block: pliron::context::Ptr<pliron::basic_block::BasicBlock>) {
+    let ret = Operation::new(
+        ctx,
+        mir::MirReturnOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    ret.insert_at_back(block, ctx);
+}
+
+// ---------------------------------------------------------------------------
+// cvt.f16x2 intrinsic lowering test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cvt_f16x2_f32_lowers_to_inline_asm() -> Result<(), anyhow::Error> {
+    use pliron::builtin::types::{FP32Type, IntegerType, Signedness};
+
+    let mut ctx = make_test_ctx();
+    let f32_ty = FP32Type::get(&ctx);
+    let i32_ty = IntegerType::get(&mut ctx, 32, Signedness::Signless);
+    let (module_ptr, entry) = build_test_kernel(&mut ctx, vec![f32_ty.into(), f32_ty.into()]);
+
+    let lo_val = entry.deref(&ctx).get_argument(0);
+    let hi_val = entry.deref(&ctx).get_argument(1);
+
+    // CvtF16x2F32Op: 2 f32 operands, 1 i32 result
+    let op = Operation::new(
+        &mut ctx,
+        nvvm::CvtF16x2F32Op::get_concrete_op_info(),
+        vec![i32_ty.into()],
+        vec![lo_val, hi_val],
+        vec![],
+        0,
+    );
+    op.insert_at_back(entry, &ctx);
+    append_return(&mut ctx, entry);
+
+    assert_inline_asm_lowering(&mut ctx, module_ptr, "cvt.rn.f16x2.f32")
+}
+
+/// Regression cover for PR #141: comparisons whose operand is a bool phi.
+///
+/// Bools are signless i1, which `can_convert_type` rejects (signless is
+/// already the LLVM form), so DialectConversion records no type history for
+/// a bool block argument. `is_signed_int_op` used to error out for such
+/// operands ("expected IntegerType or MirPtrType operand in arithmetic op");
+/// it must instead fall back to the live operand type and lower the
+/// comparison as unsigned.
+///
+/// The function mirrors the MIR of a short-circuit kernel:
+///
+/// ```text
+/// let p = a || b;            // bool phi: merge block argument
+/// out = (p == q, p < q);     // icmp eq i1 / icmp ult i1
+/// ```
+///
+/// ```text
+/// bb0(a: i1, b: i1, q: i1):  mir.cond_br a, bb2(a), bb1()
+/// bb1():                     mir.goto bb2(b)
+/// bb2(p: i1):                mir.eq p, q ; mir.lt p, q ; mir.return
+/// ```
+#[test]
+fn test_bool_phi_cmp_lowers_to_unsigned_i1_icmp() -> Result<(), anyhow::Error> {
+    use llvm_export::attributes::ICmpPredicateAttr;
+    use pliron::basic_block::BasicBlock;
+    use pliron::builtin::op_interfaces::OperandSegmentInterface;
+    use pliron::builtin::types::{FunctionType, IntegerType, Signedness};
+    use pliron::r#type::Typed;
+
+    let mut ctx = Context::new();
+    dialect_mir::register(&mut ctx);
+    dialect_nvvm::register(&mut ctx);
+    mir_lower::register(&mut ctx);
+
+    let module = ModuleOp::new(&mut ctx, "test_module".try_into().unwrap());
+    let module_ptr = module.get_operation();
+
+    let bool_ty = IntegerType::get(&mut ctx, 1, Signedness::Signless);
+    let arg_tys: Vec<pliron::context::Ptr<pliron::r#type::TypeObj>> =
+        vec![bool_ty.into(), bool_ty.into(), bool_ty.into()];
+    let func_name = "bool_phi_cmp";
+    let func_ty = FunctionType::get(&mut ctx, arg_tys.clone(), vec![]);
+
+    let func_op_ptr = Operation::new(
+        &mut ctx,
+        mir::MirFuncOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        1,
+    );
+    let func_ty_attr = pliron::builtin::attributes::TypeAttr::new(func_ty.into());
+    let func = mir::MirFuncOp::new(&mut ctx, func_op_ptr, func_ty_attr);
+    func.set_symbol_name(&mut ctx, func_name.try_into().unwrap());
+
+    let region = func.get_operation().deref(&ctx).get_region(0);
+
+    // bb0(a, b, q): the function entry.
+    let bb0 = BasicBlock::new(&mut ctx, None, arg_tys);
+    bb0.insert_at_back(region, &ctx);
+    let a = bb0.deref(&ctx).get_argument(0);
+    let b = bb0.deref(&ctx).get_argument(1);
+    let q = bb0.deref(&ctx).get_argument(2);
+
+    // bb1(): the short-circuit "evaluate b" block.
+    let bb1 = BasicBlock::new(&mut ctx, None, vec![]);
+    bb1.insert_at_back(region, &ctx);
+
+    // bb2(p): the merge block; `p` is the bool phi.
+    let bb2 = BasicBlock::new(&mut ctx, None, vec![bool_ty.into()]);
+    bb2.insert_at_back(region, &ctx);
+    let p = bb2.deref(&ctx).get_argument(0);
+
+    // bb0: cond_br a, bb2(a), bb1(). On the true edge `a` is true, so
+    // passing `a` itself is `a || b` without needing a constant.
+    let (flat_operands, segment_sizes) =
+        mir::MirCondBranchOp::compute_segment_sizes(vec![vec![a], vec![a], vec![]]);
+    let cond_br = Operation::new(
+        &mut ctx,
+        mir::MirCondBranchOp::get_concrete_op_info(),
+        vec![],
+        flat_operands,
+        vec![bb2, bb1],
+        0,
+    );
+    Operation::get_op::<mir::MirCondBranchOp>(cond_br, &ctx)
+        .expect("MirCondBranchOp")
+        .set_operand_segment_sizes(&mut ctx, segment_sizes);
+    cond_br.insert_at_back(bb0, &ctx);
+
+    // bb1: goto bb2(b).
+    let goto = Operation::new(
+        &mut ctx,
+        mir::MirGotoOp::get_concrete_op_info(),
+        vec![],
+        vec![b],
+        vec![bb2],
+        0,
+    );
+    goto.insert_at_back(bb1, &ctx);
+
+    // bb2: p == q, then p < q.
+    for info in [
+        mir::MirEqOp::get_concrete_op_info(),
+        mir::MirLtOp::get_concrete_op_info(),
+    ] {
+        let cmp = Operation::new(&mut ctx, info, vec![bool_ty.into()], vec![p, q], vec![], 0);
+        cmp.insert_at_back(bb2, &ctx);
+    }
+    let ret_op = Operation::new(
+        &mut ctx,
+        mir::MirReturnOp::get_concrete_op_info(),
+        vec![],
+        vec![],
+        vec![],
+        0,
+    );
+    ret_op.insert_at_back(bb2, &ctx);
+
+    let module_region = module.get_operation().deref(&ctx).get_region(0);
+    let module_block = module_region.deref(&ctx).iter(&ctx).next().unwrap();
+    func.get_operation().insert_at_back(module_block, &ctx);
+
+    // Before the fallback, this failed with "expected IntegerType or
+    // MirPtrType operand in arithmetic op".
+    mir_lower::lower_mir_to_llvm(&mut ctx, module_ptr).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    let mut icmps = Vec::new();
+    let module_op = module_ptr.deref(&ctx);
+    let region = module_op.get_region(0);
+    let block = region.deref(&ctx).iter(&ctx).next().unwrap();
+    for op in block.deref(&ctx).iter(&ctx) {
+        let Some(func_op) = Operation::get_op::<llvm::FuncOp>(op, &ctx) else {
+            continue;
+        };
+        if func_op.get_symbol_name(&ctx).to_string() != func_name {
+            continue;
+        }
+        let func_region = func_op.get_operation().deref(&ctx).get_region(0);
+        for func_block in func_region.deref(&ctx).iter(&ctx) {
+            for body_op in func_block.deref(&ctx).iter(&ctx) {
+                if let Some(icmp) = Operation::get_op::<llvm::ICmpOp>(body_op, &ctx) {
+                    let lhs_ty = body_op.deref(&ctx).get_operand(0).get_type(&ctx);
+                    icmps.push((icmp.predicate(&ctx), lhs_ty));
+                }
+            }
+        }
+    }
+
+    let i1: pliron::context::Ptr<pliron::r#type::TypeObj> = bool_ty.into();
+    assert_eq!(
+        icmps,
+        vec![(ICmpPredicateAttr::EQ, i1), (ICmpPredicateAttr::ULT, i1),],
+        "bool-phi comparisons must lower to `icmp eq i1` and `icmp ult i1`"
+    );
+    Ok(())
+}

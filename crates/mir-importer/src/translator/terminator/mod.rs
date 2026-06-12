@@ -1170,6 +1170,25 @@ fn translate_call(
         );
     }
 
+    // The collector skips the entire `libm` crate: every libm call must be
+    // intercepted by the float-math dispatch above and rerouted to a
+    // libdevice intrinsic, so no definition for a libm symbol ever exists in
+    // the module. A libm function the dispatch does not recognize would only
+    // fail much later, as a bare "Symbol libm__cbrtf not found" verifier
+    // error on the LLVM dialect module. Fail here instead, with the
+    // function's name and source location.
+    if let Some(ref name) = pattern_name
+        && intrinsics::float_math::is_libm_path(name)
+    {
+        return input_err!(
+            loc,
+            TranslationErr::unsupported(format!(
+                "libm function `{name}` is not yet mapped to a libdevice intrinsic; \
+                 add it to `from_libm_path` in the mir-importer float-math dispatch"
+            ))
+        );
+    }
+
     // Not an intrinsic - emit regular function call
     let raw_name = call_name.unwrap_or_else(|| "unknown_function".to_string());
     let legal_name = legaliser.legalise(&raw_name);
@@ -1529,6 +1548,12 @@ fn extract_closure_body_name(closure_arg: &mir::Operand, body: &mir::Body) -> Op
 /// For generic calls, `Instance::resolve` + `mangled_name` is used instead, which
 /// the collector also matches via `compute_export_name`.
 ///
+/// Foreign items (`extern "C"` block declarations) are the exception: they
+/// have no MIR body, so the collector never exports a definition under the
+/// FQDN and the device linker (libdevice, external LTOIR) only knows the
+/// link symbol. `call_name` for those is `Instance::mangled_name`, which is
+/// the link symbol (it honours `#[link_name]`).
+///
 fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Option<String>) {
     match func {
         mir::Operand::Constant(const_op) => match const_op.const_.kind() {
@@ -1539,16 +1564,26 @@ fn extract_func_info(func: &mir::Operand) -> (Option<String>, Option<String>, Op
                         fn_def,
                         substs,
                     )) => {
+                        use rustc_public::mir::mono::Instance;
+
                         let pattern_name = fn_def.name().as_str().to_string();
 
                         let has_generic_args = !substs.0.is_empty();
                         let call_name = if has_generic_args {
-                            use rustc_public::mir::mono::Instance;
                             if let Ok(instance) = Instance::resolve(*fn_def, substs) {
                                 instance.mangled_name()
                             } else {
                                 pattern_name.clone()
                             }
+                        } else if let Ok(instance) = Instance::resolve(*fn_def, substs)
+                            && instance.is_foreign_item()
+                        {
+                            // Foreign items (`extern "C"` blocks) have no MIR
+                            // body, so no definition is ever exported under
+                            // the FQDN. Emit the call under the link symbol
+                            // (e.g. `__nv_asinf`), which is what libdevice or
+                            // externally linked LTOIR actually provides.
+                            instance.mangled_name()
                         } else {
                             pattern_name.clone()
                         };
@@ -1636,6 +1671,22 @@ fn try_dispatch_intrinsic(
             ctx,
             body,
             intrinsic,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?));
+    }
+
+    if let Some(is_f64) = intrinsics::float_math::libm_sincos_is_f64(name) {
+        return Ok(Some(intrinsics::float_math::emit_sincos(
+            ctx,
+            body,
+            is_f64,
             args,
             destination,
             target,
@@ -2055,6 +2106,22 @@ fn try_dispatch_intrinsic(
                 ctx, args, target, block_ptr, prev_op, block_map, loc,
             )?))
         }
+
+        // =================================================================
+        // Type Conversions
+        // =================================================================
+        "cuda_device::convert::cvt_f16x2_f32" => Ok(Some(intrinsics::convert::emit_cvt_f16x2_f32(
+            ctx,
+            body,
+            args,
+            destination,
+            target,
+            block_ptr,
+            prev_op,
+            value_map,
+            block_map,
+            loc,
+        )?)),
 
         // =================================================================
         // Debug & Profiling (from intrinsics::debug)

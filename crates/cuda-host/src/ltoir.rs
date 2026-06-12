@@ -29,8 +29,8 @@
 //! # Discovery
 //!
 //! - **libNVVM**: `LIBNVVM_PATH` env var, then system loader, then
-//!   `<root>/nvvm/lib64/libnvvm.so` for `<root>` in `CUDA_HOME`,
-//!   `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
+//!   `<root>/nvvm/lib64/libnvvm.so` for `<root>` in `CUDA_TOOLKIT_PATH`,
+//!   `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
 //! - **nvJitLink**: same, but at `<root>/lib64/libnvJitLink.so`.
 //! - **libdevice**: `CUDA_OXIDE_LIBDEVICE` env var, then
 //!   `<root>/nvvm/libdevice/libdevice.10.bc` for the same roots.
@@ -77,7 +77,7 @@ pub enum LtoirError {
     /// `libdevice.10.bc` could not be located. `tried` lists every path
     /// that was probed, in order, joined by newlines.
     #[error(
-        "Could not locate libdevice.10.bc. Set CUDA_OXIDE_LIBDEVICE or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
+        "Could not locate libdevice.10.bc. Set CUDA_OXIDE_LIBDEVICE, CUDA_TOOLKIT_PATH, or CUDA_HOME, or install the CUDA Toolkit. Tried:\n  {tried}"
     )]
     LibdeviceNotFound {
         /// Newline-joined list of paths that were probed.
@@ -290,8 +290,9 @@ pub fn load_kernel_module(
 /// Search order:
 /// 1. `CUDA_OXIDE_LIBDEVICE` env var (used as-is if it points to an
 ///    existing file).
-/// 2. `<root>/nvvm/libdevice/libdevice.10.bc` for `<root>` in `CUDA_HOME`,
-///    `CUDA_PATH`, `/usr/local/cuda`, `/opt/cuda`.
+/// 2. `<root>/nvvm/libdevice/libdevice.10.bc` for `<root>` in
+///    `CUDA_TOOLKIT_PATH`, `CUDA_HOME`, `CUDA_PATH`, `/usr/local/cuda`,
+///    `/opt/cuda`.
 ///
 /// Returns [`LtoirError::LibdeviceNotFound`] with the full list of probed
 /// paths if nothing matches.
@@ -352,9 +353,13 @@ fn manifest_dir() -> PathBuf {
 // ============================================================================
 
 fn cuda_roots() -> Vec<PathBuf> {
+    cuda_roots_from_env(|var| std::env::var(var).ok())
+}
+
+fn cuda_roots_from_env(mut get_env: impl FnMut(&str) -> Option<String>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for var in ["CUDA_HOME", "CUDA_PATH"] {
-        if let Ok(r) = std::env::var(var) {
+    for var in ["CUDA_TOOLKIT_PATH", "CUDA_HOME", "CUDA_PATH"] {
+        if let Some(r) = get_env(var) {
             roots.push(PathBuf::from(r));
         }
     }
@@ -390,4 +395,30 @@ fn needs_rebuild(target: &Path, sources: &[&Path]) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_roots_prefers_project_toolkit_env_var() {
+        let roots = cuda_roots_from_env(|var| match var {
+            "CUDA_TOOLKIT_PATH" => Some("/cuda/toolkit".to_string()),
+            "CUDA_HOME" => Some("/cuda/home".to_string()),
+            "CUDA_PATH" => Some("/cuda/path".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("/cuda/toolkit"),
+                PathBuf::from("/cuda/home"),
+                PathBuf::from("/cuda/path"),
+                PathBuf::from("/usr/local/cuda"),
+                PathBuf::from("/opt/cuda"),
+            ]
+        );
+    }
 }
