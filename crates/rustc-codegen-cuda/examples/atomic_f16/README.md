@@ -12,6 +12,8 @@ The default binary checks:
 
 - `DeviceAtomicF16::fetch_add`
 - `DeviceAtomicF16::fetch_sub`
+- `DeviceAtomicF16::swap`
+- `DeviceAtomicF16::load` / `DeviceAtomicF16::store`
 - `BlockAtomicF16::fetch_add`
 - `SystemAtomicF16::fetch_add`
 - returned old values and final bin counts

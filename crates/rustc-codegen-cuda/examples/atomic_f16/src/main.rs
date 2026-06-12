@@ -64,6 +64,35 @@ mod kernels {
             *out_elem = prev;
         }
     }
+
+    #[kernel]
+    pub fn device_swap_f16(cell: &[f16], vals: &[f16], mut old: DisjointSlice<f16>, n: u32) {
+        let gid = thread::index_1d();
+        let i = gid.get();
+        if i >= n as usize {
+            return;
+        }
+        let cell = unsafe { &*(cell.as_ptr() as *const DeviceAtomicF16) };
+        let prev = cell.swap(vals[i], AtomicOrdering::Relaxed);
+        if let Some(out_elem) = old.get_mut(gid) {
+            *out_elem = prev;
+        }
+    }
+
+    #[kernel]
+    pub fn device_store_load_f16(cells: &[f16], mut out: DisjointSlice<f16>, n: u32) {
+        let gid = thread::index_1d();
+        let i = gid.get();
+        if i >= n as usize {
+            return;
+        }
+        let cell = unsafe { &*(cells.as_ptr().add(i) as *const DeviceAtomicF16) };
+        let seen = cell.load(AtomicOrdering::Acquire);
+        cell.store(seen + 1.0f16, AtomicOrdering::Release);
+        if let Some(out_elem) = out.get_mut(gid) {
+            *out_elem = seen;
+        }
+    }
 }
 
 fn main() {
@@ -77,6 +106,8 @@ fn main() {
     run_device_hist(&module, &stream, 4096, 16);
     run_device_sub(&module, &stream, 256);
     run_system_add(&module, &stream, 256);
+    run_device_swap(&module, &stream, 256);
+    run_device_store_load(&module, &stream, 256);
     run_block_hist(&module, &stream, 4, 64);
 
     println!("\nSUCCESS: all f16 atomic checks passed");
@@ -135,7 +166,12 @@ fn run_device_sub(module: &kernels::LoadedModule, stream: &cuda_core::CudaStream
 
     let final_count = counter.to_host_vec(stream).unwrap()[0].to_bits();
     check_slice("fetch_sub final count", &[final_count], &[0.0f16.to_bits()]);
-    check_old_range("fetch_sub old values", &old.to_host_vec(stream).unwrap(), 1, n);
+    check_old_range(
+        "fetch_sub old values",
+        &old.to_host_vec(stream).unwrap(),
+        1,
+        n,
+    );
 }
 
 fn run_system_add(module: &kernels::LoadedModule, stream: &cuda_core::CudaStream, n: u32) {
@@ -161,6 +197,79 @@ fn run_system_add(module: &kernels::LoadedModule, stream: &cuda_core::CudaStream
         &old.to_host_vec(stream).unwrap(),
         n,
     );
+}
+
+fn run_device_swap(module: &kernels::LoadedModule, stream: &cuda_core::CudaStream, n: u32) {
+    println!("--- DeviceAtomicF16 swap: n={n} ---");
+
+    let cell = DeviceBuffer::<f16>::zeroed(stream, 1).unwrap();
+    let host_vals: Vec<f16> = (1..=n).map(|v| v as f16).collect();
+    let vals = DeviceBuffer::from_host(stream, &host_vals).unwrap();
+    let mut old = DeviceBuffer::<f16>::zeroed(stream, n as usize).unwrap();
+
+    module
+        .device_swap_f16(
+            stream,
+            LaunchConfig::for_num_elems(n),
+            &cell,
+            &vals,
+            &mut old,
+            n,
+        )
+        .expect("Kernel launch failed");
+
+    stream.synchronize().unwrap();
+
+    // Each swap returns whatever the previous swap (or the initial zero) left
+    // in the cell, so {old values} + {final} must equal {initial} + {vals}.
+    let mut got: Vec<u16> = old
+        .to_host_vec(stream)
+        .unwrap()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+    got.push(cell.to_host_vec(stream).unwrap()[0].to_bits());
+    got.sort();
+
+    let mut expected: Vec<u16> = std::iter::once(0.0f16)
+        .chain(host_vals.iter().copied())
+        .map(|v| v.to_bits())
+        .collect();
+    expected.sort();
+
+    check_slice("swap old values + final", &got, &expected);
+}
+
+fn run_device_store_load(module: &kernels::LoadedModule, stream: &cuda_core::CudaStream, n: u32) {
+    println!("--- DeviceAtomicF16 load/store: n={n} ---");
+
+    let host_init: Vec<f16> = (0..n).map(|v| v as f16).collect();
+    let cells = DeviceBuffer::from_host(stream, &host_init).unwrap();
+    let mut out = DeviceBuffer::<f16>::zeroed(stream, n as usize).unwrap();
+
+    module
+        .device_store_load_f16(stream, LaunchConfig::for_num_elems(n), &cells, &mut out, n)
+        .expect("Kernel launch failed");
+
+    stream.synchronize().unwrap();
+
+    let loaded: Vec<u16> = out
+        .to_host_vec(stream)
+        .unwrap()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+    let expected_loaded: Vec<u16> = host_init.iter().map(|v| v.to_bits()).collect();
+    check_slice("atomic load values", &loaded, &expected_loaded);
+
+    let stored: Vec<u16> = cells
+        .to_host_vec(stream)
+        .unwrap()
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+    let expected_stored: Vec<u16> = host_init.iter().map(|v| (*v + 1.0f16).to_bits()).collect();
+    check_slice("atomic store values", &stored, &expected_stored);
 }
 
 fn run_block_hist(
@@ -223,7 +332,11 @@ fn check_device_old_values(old_values: &[f16], n: u32, nbins: u32) {
             .filter(|(i, _)| *i % nbins as usize == bin as usize)
             .map(|(_, &value)| value)
             .collect();
-        check_old_sequence("device old values", &got, expected_bin_count(n, nbins, bin) as u32);
+        check_old_sequence(
+            "device old values",
+            &got,
+            expected_bin_count(n, nbins, bin) as u32,
+        );
     }
 }
 

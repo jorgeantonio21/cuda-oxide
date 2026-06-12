@@ -168,7 +168,10 @@ where
     Ok(start.elapsed_ms(&end)? as f64 / iters as f64)
 }
 
-fn reset<T>(buffer: &DeviceBuffer<T>, stream: &CudaStream) -> Result<(), Box<dyn std::error::Error>> {
+fn reset<T>(
+    buffer: &DeviceBuffer<T>,
+    stream: &CudaStream,
+) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         cuda_core::memory::memset_d8_async(
             buffer.cu_deviceptr(),
