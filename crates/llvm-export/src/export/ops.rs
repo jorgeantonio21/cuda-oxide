@@ -13,7 +13,7 @@ use pliron::r#type::Typed;
 use pliron::{
     basic_block::BasicBlock,
     builtin::{
-        attributes::{BoolAttr, FPDoubleAttr, FPSingleAttr, IntegerAttr, StringAttr},
+        attributes::{FPDoubleAttr, FPSingleAttr, IntegerAttr, StringAttr},
         op_interfaces::{CallOpCallable, CallOpInterface},
     },
     context::Ptr,
@@ -980,8 +980,7 @@ impl<'a> ModuleExportState<'a> {
         let op_ref = op.get_operation().deref(self.ctx);
         let asm_template = read_string_attr(op.get_attr_inline_asm_template(self.ctx));
         let constraints = read_string_attr(op.get_attr_inline_asm_constraints(self.ctx));
-        let sideeffect = ops::inline_asm_sideeffect(self.ctx, op.get_operation());
-        let is_convergent = read_bool_attr(op.get_attr_inline_asm_convergent(self.ctx));
+        let kind = ops::asm_kind(self.ctx, op);
 
         // pliron-llvm always stores a single result slot (a void result for
         // no-value asm), so decide void vs valued by the result *type*, not the
@@ -996,13 +995,14 @@ impl<'a> ModuleExportState<'a> {
             self.export_type(res_ty, output)?;
         }
 
-        write!(output, " asm").unwrap();
-        if sideeffect {
-            write!(output, " sideeffect").unwrap();
-        }
+        // Emit `sideeffect` unless the asm is pure (no observable side effects).
+        let sideeffect = match kind {
+            ops::AsmKind::Pure | ops::AsmKind::ConvergentPure => "",
+            ops::AsmKind::Convergent | ops::AsmKind::SideEffect => " sideeffect",
+        };
         let asm_template = format_string_literal(&asm_template);
         let constraints = format_string_literal(&constraints);
-        write!(output, " {asm_template}, {constraints}(").unwrap();
+        write!(output, " asm{sideeffect} {asm_template}, {constraints}(").unwrap();
         for (i, arg) in op_ref.operands().enumerate() {
             if i > 0 {
                 write!(output, ", ").unwrap();
@@ -1012,11 +1012,14 @@ impl<'a> ModuleExportState<'a> {
             self.export_value(arg, value_names, output)?;
         }
 
-        if is_convergent {
-            writeln!(output, ") #0").unwrap();
-            self.convergent_used = true;
-        } else {
-            writeln!(output, ")").unwrap();
+        match kind {
+            ops::AsmKind::Convergent | ops::AsmKind::ConvergentPure => {
+                writeln!(output, ") #0").unwrap();
+                self.convergent_used = true;
+            }
+            ops::AsmKind::SideEffect | ops::AsmKind::Pure => {
+                writeln!(output, ")").unwrap();
+            }
         }
         Ok(())
     }
@@ -1277,11 +1280,6 @@ fn ptr_qualifier(addrspace: u32) -> String {
 /// Read an optional `StringAttr` to an owned `String` (absent → empty).
 fn read_string_attr(attr: Option<Ref<StringAttr>>) -> String {
     attr.map(|s| String::from((*s).clone())).unwrap_or_default()
-}
-
-/// Read an optional `BoolAttr` to a `bool` (absent → false).
-fn read_bool_attr(attr: Option<Ref<BoolAttr>>) -> bool {
-    attr.map(|b| bool::from((*b).clone())).unwrap_or(false)
 }
 
 /// LLVM mnemonic for an atomic ordering. Ordering is always present on atomic
