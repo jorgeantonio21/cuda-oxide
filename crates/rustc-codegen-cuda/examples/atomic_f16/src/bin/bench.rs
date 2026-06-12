@@ -1,5 +1,7 @@
-// Copyright (c) 2024-2026 NVIDIA CORPORATION. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
 //! f32 vs f16 global atomic-add microbenchmark.
 //!
