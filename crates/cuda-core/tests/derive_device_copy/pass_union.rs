@@ -3,13 +3,8 @@
 
 use cuda_core::DeviceCopy;
 
-#[derive(Copy, Clone, DeviceCopy)]
-enum Packet {
-    Empty,
-    Scalar(u32),
-    Pair { x: f32, y: [u16; 2] },
-}
-
+// Unions are untagged, so any bit pattern (including all-zero) is valid as
+// long as every field is itself `DeviceCopy`. The derive accepts them.
 #[derive(Copy, Clone, DeviceCopy)]
 union Word {
     bits: u32,
@@ -19,6 +14,5 @@ union Word {
 fn assert_device_copy<T: DeviceCopy>() {}
 
 fn main() {
-    assert_device_copy::<Packet>();
     assert_device_copy::<Word>();
 }

@@ -5,6 +5,7 @@
 fn device_copy_derive_compile_pass() {
     let t = trybuild::TestCases::new();
     t.pass("tests/derive_device_copy/pass_structs.rs");
-    t.pass("tests/derive_device_copy/pass_enum_union.rs");
+    t.pass("tests/derive_device_copy/pass_union.rs");
     t.compile_fail("tests/derive_device_copy/fail_non_device_copy_field.rs");
+    t.compile_fail("tests/derive_device_copy/fail_enum.rs");
 }
