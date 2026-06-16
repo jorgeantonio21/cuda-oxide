@@ -105,3 +105,29 @@ fn device_buffer_async_compat_methods_roundtrip() {
         .expect("failed to async free empty buffer");
     stream.synchronize().expect("stream sync failed");
 }
+
+// Dangerous-path regression: a stream-ordered (`cuMemAllocAsync`) buffer that
+// is dropped *implicitly* while a copy is still in flight, with NO explicit
+// synchronization. The buffer co-owns its stream, so `Drop` frees it with
+// `cuMemFreeAsync` on that same stream (stream-ordered, race-free) instead of
+// the synchronous `cuMemFree`. Run under `compute-sanitizer --tool memcheck`
+// to catch a regression: pairing async-pool allocation with the synchronous
+// free reports "free-before-alloc" here.
+#[test]
+fn uninitialized_async_implicit_drop_is_stream_ordered() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+
+    let n = 1 << 20; // 4 MiB of u32
+    let src = DeviceBuffer::<u32>::zeroed(&stream, n).expect("failed to allocate source buffer");
+    for _ in 0..64 {
+        let mut dst = unsafe { DeviceBuffer::<u32>::uninitialized_async(&stream, n) }
+            .expect("failed to allocate uninitialized device buffer");
+        // Enqueue a large async device-to-device copy, then let `dst` drop
+        // immediately with no `stream.synchronize()` in between.
+        dst.copy_from_device_async(&src, &stream)
+            .expect("failed to enqueue device-to-device copy");
+        drop(dst);
+    }
+    stream.synchronize().expect("stream sync failed");
+}
