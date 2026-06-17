@@ -245,47 +245,37 @@ Useful aliases:
 | `line-tables`, `line`, `lines`, `1` | source line tables only |
 | `full`, `2` | line tables plus basic variable metadata |
 
-### Debug and optimization knobs
+### Why full debug turns optimization off
 
-There are two separate knobs:
+Reliable local inspection and aggressive optimization pull in opposite
+directions. An optimized value usually lives in a register only across the
+short window where it is used; outside that window the debugger honestly has
+nowhere to read it from, so `info locals` shows `<optimized out>`. The only way
+to make a variable inspectable for its whole scope is to keep it in **memory**
+and describe it with `llvm.dbg.declare`, the way every debug build does
+(`gcc -O0`, `rustc` debug, and nvcc `-G`).
 
-```text
-debug mode        -> what metadata cuda-oxide emits
-LLVM optimization -> whether exported LLVM IR goes through opt -O2
-```
+So `CUDA_OXIDE_DEBUG=full` is a `-G`-style build. It automatically:
 
-If you think of this as `debug = ...` and `optimize = 1/0`:
+- keeps every source local in its stack slot (skips Pliron `mem2reg`),
+- skips LLVM `opt -O2`, and
+- runs `llc` at `-O0`,
+
+so the locals you see in cuda-gdb are real and stable. You do not need to set
+`CUDA_OXIDE_NO_OPT=1` yourself; full mode implies it.
 
 | Setting | Meaning |
-|:--------|:--------|
-| `CUDA_OXIDE_DEBUG=off` | no device debug metadata |
-| `CUDA_OXIDE_DEBUG=line-tables` | source lines only |
-| `CUDA_OXIDE_DEBUG=full` | source lines plus supported locals and args |
-| default optimization | LLVM `opt -O2` runs before `llc` |
-| `CUDA_OXIDE_NO_OPT=1` | skip LLVM `opt -O2`; feed the unoptimized `.ll` to `llc` |
+| :------ | :------ |
+| `CUDA_OXIDE_DEBUG=off` | no device debug metadata; fully optimized PTX |
+| `CUDA_OXIDE_DEBUG=line-tables` | source lines only; still optimized |
+| `CUDA_OXIDE_DEBUG=full` | source lines plus locals/args; optimization off (`-G`) |
 
-Pliron `mem2reg` is different from LLVM `opt -O2`: it is part of the normal
-MIR pipeline and still runs before LLVM export. In full debug mode, when
-`mem2reg` removes a stack slot for a simple debugged local, cuda-oxide leaves a
-value record behind:
+Line tables stay on the optimized pipeline because a line map survives
+optimization well; locals do not, which is why full mode steps off it.
 
-```text
-before mem2reg:  dbg.declare(%x.slot, "x")
-after mem2reg:   dbg.value(%x.current_value, "x")
-```
-
-So:
-
-```text
-line-tables + optimize=1  -> fast source stepping, no locals
-line-tables + optimize=0  -> less optimized source stepping, no locals
-full        + optimize=1  -> locals when they survive/salvage through opt
-full        + optimize=0  -> simpler IR for cuda-gdb, usually easier locals
-```
-
-`full + optimize=0` is the most debugger-friendly shape. `full + optimize=1`
-is useful when you want to inspect locals without completely leaving the
-optimized pipeline, but some values may honestly show up as optimized out.
+> The promotion-aware `mir.dbg_value` salvage that Pliron `mem2reg` performs is
+> the building block for a future *optimized* debug tier (locals through
+> `opt -O2`, best-effort). It is not what `full` uses today.
 
 ### What works today
 
@@ -296,17 +286,22 @@ Line-table mode supports:
 - helper/inlined source locations from other files, such as stepping from your
   kernel into `cuda-device/src/thread.rs`
 
-Full mode currently supports the first simple variable slice:
+Full mode (`-G`) supports inspecting:
 
-- whole local variables and arguments that rustc exposes through
-  `var_debug_info`
-- `bool`, integer, float, raw-pointer, and reference-shaped debug types
-- `llvm.dbg.declare` for remaining stack slots and `llvm.dbg.value` for simple
-  locals promoted by Pliron/LLVM
+- local variables and arguments rustc exposes through `var_debug_info`
+- scalar types (`bool`, integers, floats), raw pointers, and references
+- structs, tuples, and fixed-size arrays, with their fields shown at the
+  correct (real-layout) offsets, e.g.
+  `out = DisjointSlice {ptr: 0x..., len: 1}` and `idx = ThreadIndex {raw: 0}`
 
-Full mode does **not** yet describe rich Rust type trees such as structs,
-tuples, slices, arrays, closures, projections like `x.0`, or destructured
-variables.
+End-to-end behavior (breakpoint binds, backtrace, `info args`/`info locals`) is
+checked on real hardware by `scripts/debug-smoketest.sh`.
+
+Full mode does **not** yet describe: enums (`Option`, `Result`, and other
+multi-variant types), bare slice arguments split into a `(ptr, len)` pair at
+the ABI boundary, closures, projections like `x.0`, or destructured variables.
+Locals of an inlined helper frame may also show fewer entries than the kernel
+frame; select the kernel frame (`frame 1`) to inspect kernel locals.
 
 ### Breakpoint workflow
 

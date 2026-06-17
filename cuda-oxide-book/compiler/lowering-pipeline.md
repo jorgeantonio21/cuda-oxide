@@ -397,29 +397,32 @@ call void @llvm.dbg.declare(metadata ptr %tid_slot, metadata !tid, metadata !DIE
 !tid = !DILocalVariable(name: "tid", scope: !func, file: !file, line: 31, type: !u32)
 ```
 
-The initial model is intentionally simple:
+The model is the one every debug build uses:
 
 ```text
 dbg.declare -> "this source variable lives at this address"
 ```
 
-When Pliron `mem2reg` promotes that stack slot to an SSA value, cuda-oxide
-leaves behind a value-based debug record:
+Because the address is stable for the variable's whole scope, cuda-gdb can read
+it at any breakpoint inside that scope. To keep those addresses real, full-debug
+is a `-G`-style build: it **skips** Pliron `mem2reg` (so the stack slots
+survive), **skips** LLVM `opt -O2`, and runs `llc` at `-O0`. Promoting a local
+to an SSA value would shrink its inspectable range to its register's liveness,
+which is exactly how an optimized build ends up showing in-scope locals as
+`<optimized out>`.
+
+The aggregate locals (structs, tuples, arrays) get a `DICompositeType` whose
+members carry rustc's real layout offsets, so `info locals` prints their fields:
 
 ```text
-dbg.value -> "this source variable has this SSA value here"
+out = DisjointSlice {ptr: 0x..., len: 1}
 ```
 
-Small picture:
-
-```text
-before mem2reg:  dbg.declare(%x.slot, "x")
-after mem2reg:   dbg.value(%x.current_value, "x")
-```
-
-That keeps the normal MIR `mem2reg` pipeline enabled in full-debug mode for the
-simple whole-local slice. LLVM `-O2` is still allowed afterward because LLVM
-also knows how to preserve many `dbg.declare` / `dbg.value` locations.
+Pliron `mem2reg` still has a promotion-aware salvage path: when it promotes a
+debug-tagged slot it emits a `mir.dbg_value` ("this source variable has this SSA
+value here") that lowers to `llvm.dbg.value`. That is the groundwork for a
+future *optimized* debug tier; the current `full` tier does not run `mem2reg`,
+so it relies on `dbg.declare` instead.
 
 ### Variable scopes and inlining
 
