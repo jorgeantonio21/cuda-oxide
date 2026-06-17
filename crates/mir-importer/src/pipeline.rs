@@ -1118,11 +1118,7 @@ fn generate_ptx(
     if debug_kind.variables_enabled() {
         llc_cmd.arg("-O0");
     }
-    let result = llc_cmd
-        .arg(llc_input)
-        .arg("-o")
-        .arg(ptx_path)
-        .output();
+    let result = llc_cmd.arg(llc_input).arg("-o").arg(ptx_path).output();
 
     match result {
         Ok(output) if output.status.success() => {

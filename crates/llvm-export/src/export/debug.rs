@@ -445,7 +445,8 @@ impl<'a> ModuleExportState<'a> {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let elements_id = self.alloc_metadata_id();
-                self.debug_nodes.push((elements_id, format!("!{{{elements}}}")));
+                self.debug_nodes
+                    .push((elements_id, format!("!{{{elements}}}")));
                 let name = escape_debug_string(name);
                 format!(
                     "!DICompositeType(tag: DW_TAG_structure_type, name: \"{name}\", \

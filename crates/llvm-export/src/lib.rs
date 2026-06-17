@@ -330,7 +330,10 @@ pub mod ops {
             while *pos < bytes.len() && bytes[*pos] != b' ' {
                 *pos += 1;
             }
-            let n: u64 = std::str::from_utf8(&bytes[start..*pos]).ok()?.parse().ok()?;
+            let n: u64 = std::str::from_utf8(&bytes[start..*pos])
+                .ok()?
+                .parse()
+                .ok()?;
             *pos += 1; // consume the space
             Some(n)
         }
