@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-use cuda_core::{CudaContext, DeviceBuffer};
+use cuda_core::{CudaContext, DeviceBuffer, PinnedHostBuffer};
 
 #[test]
 fn device_buffer_from_host_roundtrip() {
@@ -67,7 +67,9 @@ fn device_buffer_async_compat_methods_roundtrip() {
     let data = [7_u32, 11, 13, 17];
     let mut dev = unsafe { DeviceBuffer::<u32>::uninitialized_async(&stream, data.len()) }
         .expect("failed to allocate uninitialized device buffer");
-    dev.copy_from_host_async(&data, &stream)
+    // SAFETY: `data` remains alive and unmodified until the later
+    // `to_host_vec` call synchronizes the stream.
+    unsafe { dev.copy_from_host_async_unchecked(&stream, &data) }
         .expect("failed to copy host data into device buffer");
 
     let mut clone = unsafe { DeviceBuffer::<u32>::uninitialized_async(&stream, data.len()) }
@@ -104,6 +106,47 @@ fn device_buffer_async_compat_methods_roundtrip() {
         .drop_async(&stream)
         .expect("failed to async free empty buffer");
     stream.synchronize().expect("stream sync failed");
+}
+
+#[test]
+fn from_host_with_pinned_source_allows_source_drop_after_return() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+
+    let expected = vec![21_u32, 34, 55, 89];
+    let input =
+        PinnedHostBuffer::from_slice(&ctx, &expected).expect("failed to allocate pinned input");
+    let dev = DeviceBuffer::from_host(&stream, input.as_slice())
+        .expect("failed to copy pinned input to device");
+    drop(input);
+
+    assert_eq!(
+        dev.to_host_vec(&stream)
+            .expect("failed to copy device buffer back to host"),
+        expected
+    );
+}
+
+#[test]
+fn copy_from_host_with_pinned_source_allows_source_reuse_after_return() {
+    let ctx = CudaContext::new(0).expect("failed to create CUDA context");
+    let stream = ctx.new_stream().expect("failed to create CUDA stream");
+
+    let expected = vec![3_u32, 5, 8, 13];
+    let mut input =
+        PinnedHostBuffer::from_slice(&ctx, &expected).expect("failed to allocate pinned input");
+    let mut dev =
+        DeviceBuffer::<u32>::zeroed(&stream, input.len()).expect("failed to allocate device");
+
+    dev.copy_from_host(&stream, input.as_slice())
+        .expect("failed to copy pinned input to device");
+    input.as_mut_slice().fill(0);
+
+    assert_eq!(
+        dev.to_host_vec(&stream)
+            .expect("failed to copy device buffer back to host"),
+        expected
+    );
 }
 
 // Dangerous-path regression: a stream-ordered (`cuMemAllocAsync`) buffer that

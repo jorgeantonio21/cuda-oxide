@@ -274,25 +274,65 @@ impl<T> DeviceBuffer<T> {
 }
 
 impl<T: DeviceCopy> DeviceBuffer<T> {
-    /// Allocates device memory and copies `data` from the host, enqueued on
-    /// `stream`.
+    /// Allocates device memory, copies `data` from the host on `stream`, and
+    /// synchronizes `stream` before returning.
     ///
-    /// The host slice must remain valid until the copy completes (i.e. until
-    /// the next synchronization point on `stream`). For pageable host memory
-    /// the driver may internally synchronize; use pinned memory for true
-    /// async overlap.
+    /// The synchronization keeps this safe for borrowed host slices: `data`
+    /// may be dropped, reused, or mutated immediately after this function
+    /// returns. For true host-device overlap with caller-managed source
+    /// lifetimes, use [`Self::from_host_async_unchecked`].
     ///
     /// An empty `data` slice yields an empty buffer without touching the
     /// driver allocator.
     ///
     /// # Allocation safety on error
     ///
-    /// The returned buffer takes ownership of the device allocation
-    /// immediately after `malloc_sync`, before the fallible
-    /// `memcpy_htod_async` enqueue runs. If the enqueue fails, the early
-    /// return drops the buffer and its `Drop` impl frees the allocation, so
-    /// no device memory is leaked.
+    /// The buffer takes ownership of the device allocation immediately after
+    /// `malloc_sync`, before the fallible `memcpy_htod_async` enqueue and
+    /// stream synchronization run. If either step fails, the early return
+    /// drops the buffer and its `Drop` impl frees the allocation, so no
+    /// device memory is leaked.
     pub fn from_host(stream: &CudaStream, data: &[T]) -> Result<Self, DriverError> {
+        let ctx = stream.context().clone();
+        let len = data.len();
+        let num_bytes = std::mem::size_of_val(data);
+
+        // cuMemAlloc rejects zero-byte requests with CUDA_ERROR_INVALID_VALUE,
+        // so represent an empty buffer as a null pointer (Drop skips it).
+        if num_bytes == 0 {
+            // SAFETY: a null pointer with zero bytes is never dereferenced
+            // and Drop ignores it.
+            return Ok(unsafe { Self::from_raw_parts(0, len, ctx) });
+        }
+
+        let ptr = unsafe { crate::memory::malloc_sync(num_bytes)? };
+        // SAFETY: `ptr` was just allocated with `num_bytes` bytes in the
+        // stream's context; ownership transfers to `buf` here so any early
+        // return below frees it through the buffer's own `Drop`.
+        let buf = unsafe { Self::from_raw_parts(ptr, len, ctx) };
+        let enqueue_result = unsafe {
+            crate::memory::memcpy_htod_async(buf.ptr, data.as_ptr(), num_bytes, stream.cu_stream())
+        };
+        let sync_result = stream.synchronize();
+        enqueue_result?;
+        sync_result?;
+        Ok(buf)
+    }
+
+    /// Allocates device memory and enqueues a host-to-device copy from `data`
+    /// on `stream`, returning without synchronizing.
+    ///
+    /// # Safety
+    ///
+    /// This call only enqueues the host-to-device copy and returns; CUDA may
+    /// still be reading from `data` after the borrow is released. The caller
+    /// must ensure `data` is not dropped, freed, mutated, or aliased until the
+    /// enqueued copy has completed, typically after the next
+    /// [`CudaStream::synchronize`] call or a stream-ordered event wait.
+    pub unsafe fn from_host_async_unchecked(
+        stream: &CudaStream,
+        data: &[T],
+    ) -> Result<Self, DriverError> {
         let ctx = stream.context().clone();
         let len = data.len();
         let num_bytes = std::mem::size_of_val(data);
@@ -357,7 +397,9 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
             Arc::ptr_eq(data.context(), stream.context()),
             "pinned host buffer and stream must belong to the same CUDA context"
         );
-        Self::from_host(stream, data.as_slice())
+        // SAFETY: this method's safety contract requires the caller to keep
+        // the pinned source valid until the enqueued copy completes.
+        unsafe { Self::from_host_async_unchecked(stream, data.as_slice()) }
     }
 
     /// Allocates zero-initialized device memory of `len` elements, enqueued
@@ -614,14 +656,40 @@ impl<T: DeviceCopy> DeviceBuffer<T> {
         }
     }
 
-    /// Copies `src` into `self` host-to-device, enqueued on `stream`.
+    /// Copies `src` into `self` host-to-device on `stream` and synchronizes
+    /// `stream` before returning.
     ///
-    /// The host slice must remain valid until the copy completes on `stream`.
+    /// The synchronization keeps this safe for borrowed host slices: `src`
+    /// may be dropped, reused, or mutated immediately after this function
+    /// returns. Panics if `src.len() != self.len()`.
+    pub fn copy_from_host(&mut self, stream: &CudaStream, src: &[T]) -> Result<(), DriverError> {
+        // SAFETY: this safe wrapper synchronizes `stream` before returning,
+        // so the borrowed host slice cannot be used by CUDA after this call.
+        let enqueue_result = unsafe { self.copy_from_host_async_unchecked(stream, src) };
+        let sync_result = if self.num_bytes() == 0 {
+            Ok(())
+        } else {
+            stream.synchronize()
+        };
+        enqueue_result?;
+        sync_result
+    }
+
+    /// Copies `src` into `self` host-to-device, enqueued on `stream`, and
+    /// returns without synchronizing.
+    ///
+    /// # Safety
+    ///
+    /// This call only enqueues the host-to-device copy and returns; CUDA may
+    /// still be reading from `src` after the borrow is released. The caller
+    /// must ensure `src` is not dropped, freed, mutated, or aliased until the
+    /// enqueued copy has completed, typically after the next
+    /// [`CudaStream::synchronize`] call or a stream-ordered event wait.
     /// Panics if `src.len() != self.len()`.
-    pub fn copy_from_host_async(
+    pub unsafe fn copy_from_host_async_unchecked(
         &mut self,
-        src: &[T],
         stream: &CudaStream,
+        src: &[T],
     ) -> Result<(), DriverError> {
         assert_eq!(
             self.len,
