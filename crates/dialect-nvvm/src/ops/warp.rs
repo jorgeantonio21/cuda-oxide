@@ -972,6 +972,43 @@ impl ReduxSyncXorOp {
     }
 }
 
+// =============================================================================
+// Leader Election (sm_90+)
+// =============================================================================
+
+/// Warp leader election: choose the lowest participating lane as leader.
+///
+/// PTX `elect.sync d|p, membermask`. Requires sm_90+ (Hopper). Lowered to
+/// convergent inline PTX (the `@llvm.nvvm.elect.sync` intrinsic has no NVPTX
+/// instruction-selection pattern in current LLVM). The instruction yields a
+/// lane id and a predicate; this op exposes both directly as two results, so
+/// no field is discarded.
+///
+/// # Operands
+///
+/// - `mask` (i32): warp lane participation mask (`-1` = full warp)
+///
+/// # Results
+///
+/// - `leader` (i32): lane id of the elected leader (lowest lane in `mask`).
+///   PTX only defines this value on the elected lane; it is unspecified on
+///   non-elected lanes
+/// - `is_elected` (i1): true only on the calling lane if it is the leader
+#[pliron_op(
+    name = "nvvm.elect_sync",
+    format,
+    verifier = "succ",
+    interfaces = [NOpdsInterface<1>, NResultsInterface<2>],
+)]
+pub struct ElectSyncOp;
+
+impl ElectSyncOp {
+    /// Wrap an existing operation pointer.
+    pub fn new(op: Ptr<Operation>) -> Self {
+        ElectSyncOp { op }
+    }
+}
+
 /// Register warp operations with the context.
 pub(super) fn register(ctx: &mut Context) {
     // Lane identification
@@ -1010,6 +1047,8 @@ pub(super) fn register(ctx: &mut Context) {
     ReduxSyncAndOp::register(ctx);
     ReduxSyncOrOp::register(ctx);
     ReduxSyncXorOp::register(ctx);
+    // Leader election (sm_90+)
+    ElectSyncOp::register(ctx);
     // Active mask
     ActiveMaskOp::register(ctx);
     // Warp-scoped barrier
